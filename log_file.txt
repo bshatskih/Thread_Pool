@@ -1,0 +1,16 @@
+Server start working; time: 19:49:52, 28.06.25
+
+The server operation has been resumed: 19:49:53, 28.06.25
+
+Soleved task with description:
+Auxiliary task for sorting the chunk
+Start working: 19:50:05, 28.06.25
+End working: 19:50:12, 28.06.25
+Duration: 7 sec
+
+Soleved task with description:
+Created and sorted file of 3000000 elements:
+Start working: 19:49:55, 28.06.25
+End working: 19:50:14, 28.06.25
+Duration: 19 sec
+
