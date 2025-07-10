@@ -5,6 +5,7 @@
 #include <vector>
 #include <queue>
 #include <unordered_map>
+#include <unordered_set>
 #include <condition_variable>
 #include <thread>
 #include <mutex>
@@ -142,6 +143,7 @@ namespace MT {
         // мьютексы, блокирующие очереди для потокобезопасного обращения
         std::mutex task_queue_mutex;
         std::mutex completed_tasks_mutex;
+        std::mutex incomplete_tasks_with_an_error_mutex;
 
         // мьютекс, блокирующий функции ожидающие результатов (методы wait*)
         std::mutex wait_mutex;
@@ -155,6 +157,9 @@ namespace MT {
         // Набор доступных потоков
         std::vector<MT::Thread> threads;
 
+        // Хранит число созданных потоков для их корректного завершения
+        size_t actual_threads_count;
+
         // Очередь задач
         std::queue<std::shared_ptr<Task>> task_queue;
         size_t last_task_id;
@@ -162,6 +167,9 @@ namespace MT {
         // массив выполненных задач в виде хэш-таблицы
 		std::unordered_map<size_t, std::shared_ptr<Task>> completed_tasks;
 		size_t completed_task_count;
+
+        // id задач, в которых возникла ошибка при выполнении
+        std::unordered_set<size_t> incomplete_tasks_with_an_error;
 
         // флаг остановки работы пула
         std::atomic<bool> stopped;

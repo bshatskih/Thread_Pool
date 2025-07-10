@@ -56,6 +56,14 @@ struct Logger {
     }
 
 
+    void log_error(const std::time_t& time, const std::string& error_info) {
+        std::ofstream file("../log_file.txt", std::ios::app);
+        file << "An error has occurred: " << error_info << '\n';
+        file << "Time: " << getCurrentTimeFormatted(time) << "\n\n";
+        file.close();
+    }
+
+
     ~Logger() {
         std::ofstream file("../log_file.txt", std::ios::app);
         file << "Server end working; time: ";

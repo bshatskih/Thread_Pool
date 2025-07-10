@@ -22,13 +22,28 @@ MT::ThreadPool::ThreadPool(size_t NUM_THREADS) : logger(logger_mutex) {
 	completed_task_count = 0;
     last_task_id = 0;
 	threads.reserve(NUM_THREADS);
+
 	for (size_t i : std::ranges::iota_view(static_cast<size_t>(0), NUM_THREADS)) {
-		threads.emplace_back();
+		try {
+			threads.emplace_back();
+		} catch (const std::system_error& e) {
+			{
+				std::lock_guard<std::mutex> cm(cout_mutex);
+				std::cerr << "Error creation thread: " << e.what() << '\n';
+			}
+			std::time_t error_time = std::time(nullptr);
+			std::lock_guard<std::mutex> lm(logger_mutex);
+			logger.log_error(error_time, std::string("Error creation thread: ") + e.what());
+			actual_threads_count = i;
+			throw;
+		}
 	}
+	
 	for (size_t i : std::ranges::iota_view(static_cast<size_t>(0), NUM_THREADS)) {
 		threads[i]._thread = std::move(std::thread(&ThreadPool::run, this, std::ref(threads[i])));
 		threads[i].is_working.store(false);
 	}
+	actual_threads_count = NUM_THREADS;
 }
 
 
@@ -37,12 +52,20 @@ MT::ThreadPool::~ThreadPool() {
 	stopped.store(true);
 	tasks_access.notify_all();
 	clear_completed();
-	for (size_t i : std::ranges::iota_view(static_cast<size_t>(0), threads.size())) {
+	for (size_t i : std::ranges::iota_view(static_cast<size_t>(0), actual_threads_count)) {
         if (threads[i]._thread.joinable()) {
 		    try {
                 threads[i]._thread.join();
-            } catch (...) {
-                std::cerr << "Error joining thread\n";
+            } catch (const std::system_error& e) {
+				std::time_t error_time = std::time(nullptr);
+				{
+					std::lock_guard<std::mutex> cm(cout_mutex);
+					std::cerr << "Error joining thread: " << e.what() << '\n';
+				}
+				if (logger_flag.load()) {
+					std::lock_guard<std::mutex> lm(logger_mutex);
+					logger.log_error(error_time, std::string("Error joining thread: ") + e.what());
+				}
             }
         }
 	}
@@ -77,7 +100,7 @@ void MT::ThreadPool::start() {
 
 
 bool MT::ThreadPool::is_comleted() const {
-	return completed_task_count == last_task_id;
+	return completed_task_count + incomplete_tasks_with_an_error.size() == last_task_id;
 }
 
 
@@ -113,7 +136,33 @@ void MT::ThreadPool::run(MT::Thread& _thread) {
 
 			std::time_t start_time = std::time(nullptr);
 
-            task->one_thread_pre_method();
+			try {
+            	task->one_thread_pre_method();
+			} catch (const std::exception& e) {
+				std::time_t error_time = std::time(nullptr);
+				std::lock_guard<std::mutex> cm(cout_mutex);
+				std::cerr << "Error when solving a problem with an id: " << task->task_id << ". Exception: " << e.what() << '\n';
+
+				if (logger_flag.load()) {
+					std::lock_guard<std::mutex> lm(logger_mutex);
+					logger.log_error(error_time, "Error when solving task " + std::to_string(task->task_id) + ": " + e.what());
+				}
+				std::lock_guard<std::mutex> itm(incomplete_tasks_with_an_error_mutex);
+				incomplete_tasks_with_an_error.insert(task->task_id);
+				continue;
+			} catch (...) {
+				std::time_t error_time = std::time(nullptr);
+				std::lock_guard<std::mutex> cm(cout_mutex);
+				std::cerr << "Unknown error in task id: " << task->task_id << '\n';
+
+				if (logger_flag.load()) {
+					std::lock_guard<std::mutex> lm(logger_mutex);
+					logger.log_error(error_time, "Unknown error in task " + std::to_string(task->task_id));
+				}
+				std::lock_guard<std::mutex> itm(incomplete_tasks_with_an_error_mutex);
+				incomplete_tasks_with_an_error.insert(task->task_id);
+				continue;
+			}
 
 			std::time_t end_time = std::time(nullptr);
 
@@ -154,7 +203,12 @@ void MT::ThreadPool::get_result(size_t task_id) {
 	} else if (task_id > last_task_id || task_id <= 0) {
 		std::cout << "Unknown task ID\n";
 	} else {
-		std::cout << "Result [" << task_id << "]: still processing...\n";
+		std::lock_guard<std::mutex> itm(incomplete_tasks_with_an_error_mutex);
+		if (incomplete_tasks_with_an_error.contains(task_id)) {
+			std::cout << "An error occurred while completing the task\n";
+		} else {
+			std::cout << "Result [" << task_id << "]: still processing...\n";
+		}
 	}
 	return;
 }
