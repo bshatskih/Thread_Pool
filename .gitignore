@@ -1,0 +1,4 @@
+build/
+.vscode/
+log_file.txt
+desktop.ini
