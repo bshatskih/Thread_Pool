@@ -17,7 +17,7 @@ TaskType parseType(const std::string& cmd) {
 
 
 int main() {
-    MT::ThreadPool thread_pool(4);
+    MT::ThreadPool thread_pool(5);
 
     std::cout << "Server started. Enter commands:\n";
   	std::cout << "compute_primes N\n"

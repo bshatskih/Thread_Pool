@@ -1,5 +1,5 @@
 #include "test_tasks.h"
-
+#include <exception>
 
 void SortRandom::one_thread_method() {
     arr.reserve(n);

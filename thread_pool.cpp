@@ -27,13 +27,16 @@ MT::ThreadPool::ThreadPool(size_t NUM_THREADS) : logger(logger_mutex) {
 		try {
 			threads.emplace_back();
 		} catch (const std::system_error& e) {
+			std::string error_code_str = std::to_string(e.code().value()); 
+			std::string error = std::string("When creating thread caught system_error with code ") + "[" + error_code_str + "] meaning " + "[" + e.what() + "]";
+			std::time_t error_time = std::time(nullptr);
+			
 			{
 				std::lock_guard<std::mutex> cm(cout_mutex);
-				std::cerr << "Error creation thread: " << e.what() << '\n';
+				std::cerr << error << '\n';
 			}
-			std::time_t error_time = std::time(nullptr);
 			std::lock_guard<std::mutex> lm(logger_mutex);
-			logger.log_error(error_time, std::string("Error creation thread: ") + e.what());
+			logger.log_error(error_time, error);
 			actual_threads_count = i;
 			throw;
 		}
@@ -57,14 +60,16 @@ MT::ThreadPool::~ThreadPool() {
 		    try {
                 threads[i]._thread.join();
             } catch (const std::system_error& e) {
+				std::string error_code_str = std::to_string(e.code().value()); 
+				std::string error = std::string("When joining thread caught system_error with code ") + "[" + error_code_str + "] meaning " + "[" + e.what() + "]";
 				std::time_t error_time = std::time(nullptr);
 				{
 					std::lock_guard<std::mutex> cm(cout_mutex);
-					std::cerr << "Error joining thread: " << e.what() << '\n';
+					std::cerr << error << '\n';
 				}
 				if (logger_flag.load()) {
 					std::lock_guard<std::mutex> lm(logger_mutex);
-					logger.log_error(error_time, std::string("Error joining thread: ") + e.what());
+					logger.log_error(error_time, error);
 				}
             }
         }
@@ -140,12 +145,13 @@ void MT::ThreadPool::run(MT::Thread& _thread) {
             	task->one_thread_pre_method();
 			} catch (const std::exception& e) {
 				std::time_t error_time = std::time(nullptr);
+				std::string error = std::string("Error when solving a problem with an id: ") + std::to_string(task->task_id) + ".\nException: " + e.what();
 				std::lock_guard<std::mutex> cm(cout_mutex);
-				std::cerr << "Error when solving a problem with an id: " << task->task_id << ". Exception: " << e.what() << '\n';
+				std::cerr << error << '\n';
 
 				if (logger_flag.load()) {
 					std::lock_guard<std::mutex> lm(logger_mutex);
-					logger.log_error(error_time, "Error when solving task " + std::to_string(task->task_id) + ": " + e.what());
+					logger.log_error(error_time, error);
 				}
 				std::lock_guard<std::mutex> itm(incomplete_tasks_with_an_error_mutex);
 				incomplete_tasks_with_an_error.insert(task->task_id);
@@ -153,11 +159,12 @@ void MT::ThreadPool::run(MT::Thread& _thread) {
 			} catch (...) {
 				std::time_t error_time = std::time(nullptr);
 				std::lock_guard<std::mutex> cm(cout_mutex);
-				std::cerr << "Unknown error in task id: " << task->task_id << '\n';
+				std::string error = std::string("Unknown error in task id: ") + std::to_string(task->task_id);
+				std::cerr << error << '\n';
 
 				if (logger_flag.load()) {
 					std::lock_guard<std::mutex> lm(logger_mutex);
-					logger.log_error(error_time, "Unknown error in task " + std::to_string(task->task_id));
+					logger.log_error(error_time, error);
 				}
 				std::lock_guard<std::mutex> itm(incomplete_tasks_with_an_error_mutex);
 				incomplete_tasks_with_an_error.insert(task->task_id);
