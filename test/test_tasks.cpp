@@ -161,10 +161,8 @@ void SortBigVec::one_thread_method() {
         thread_pool->add_task(std::move(test));
     }
 
-    {
-        std::unique_lock<std::mutex> lock(temp_files_mutex);
-        chunks_cv.wait(lock, [&]() { return completed_chunks.load() == expected_chunks; });
-    }
+    std::unique_lock<std::mutex> lock(temp_files_mutex);
+    chunks_cv.wait(lock, [&]() { return completed_chunks.load() == expected_chunks; });
 
     merge_sorted_chunks();
     file.close();
@@ -241,19 +239,136 @@ void SortingChunk::show_result() {
 
 
 
+SearchInALargeFile::SearchInALargeFile(const std::string& path_to_file_, const std::string& phrase_) :
+    MT::Task(std::string("Search for the word - ") + '"' + phrase_ + '"' + ", in a file: " + path_to_file_ + '\n'), 
+    path_to_file(path_to_file_), word(phrase_) {
+    std::ifstream file(path_to_file);
+    if (!file.is_open()) {
+        std::cout << "Couldn't open the file at the specified address\n";
+    }
+    file.close();
+}
+
+
+void SearchInALargeFile::one_thread_method() {
+    std::ifstream file(path_to_file);
+
+    std::vector<std::pair<size_t, std::string>> chunc;
+    std::string cur_str;
+    size_t cur_str_number = 1;
+    size_t expected_chunks = 0;
+    while (std::getline(file, cur_str)) {
+        chunc.emplace_back(cur_str_number, cur_str);
+        if (chunc.size() == chunk_size) {
+            std::shared_ptr test = std::make_shared<SearchInAChunk>(*this, std::move(chunc));
+            thread_pool->add_task(test);
+            chunc.clear();
+            ++expected_chunks;
+        }
+        ++cur_str_number;
+    }
+
+    std::unique_lock<std::mutex> ifm(information_found_mutex);
+    information_cv.wait(ifm, [&]() { return completed_chunks.load() == expected_chunks; });
+
+    file.close();
+
+    return;
+}
+
+
+void SearchInALargeFile::show_result() {
+    std::cout << description;
+    std::lock_guard<std::mutex> ifm(information_found_mutex);
+
+    size_t count = 0;
+    for (auto it = information_found.cbegin(); it != information_found.cend(); ++it) {
+        count += it->second.second;
+    }
+    std::cout << std::to_string(count) + " occurrences of the word " + '"' + word + '"' + " were found in the text\n";
+    std::cout << "if you want to see the lines in which the word occurs, press 'Y' or 'N' otherwise\n";
+    char command = *std::istream_iterator<char>(std::cin);
+    if (command == 'Y') {
+        for (auto it = information_found.cbegin(); it != information_found.cend(); ++it) {
+            std::cout << "Line: " << std::to_string(it->first) + ", quantity: " + std::to_string(it->second.second) + ", " + '"' + it->second.first + '"' + '\n';
+        }
+    }
+    std::cin.get();
+    return;
+}
+
+
+SearchInAChunk::SearchInAChunk(SearchInALargeFile& parrent_, std::vector<std::pair<size_t, std::string>>&& chunc_) :
+    MT::Task("Auxiliary task for searching in a file\n"), parrent(parrent_), chunc(std::move(chunc_)) {}
 
 
 
+std::vector<size_t> ComputeLPS(const std::string& word) {
+    size_t m = word.length();
+    std::vector<size_t> lps(m, 0);
+    size_t len = 0; 
+
+    for (size_t i = 1; i < m; ) {
+        if (word[i] == word[len]) {
+            len++;
+            lps[i] = len;
+            i++;
+        } else {
+            if (len != 0) {
+                len = lps[len - 1];
+            } else {
+                lps[i] = 0;
+                i++;
+            }
+        }
+    }
+    return lps;
+}
 
 
+void SearchInAChunk::one_thread_method() {
+    size_t m = parrent.word.length();
+    for (size_t k : std::ranges::iota_view(0u, chunc.size())) {
+        const std::string& text = chunc[k].second;
+        const std::string& word = parrent.word;
+        size_t n = text.size();
+        if (m == 0 || n < m) {
+            continue;
+        }
+
+        std::vector<size_t> lps = ComputeLPS(word);
+        size_t i = 0, j = 0, cur_count = 0;
+
+        while (i < n) {
+            if (text[i] == word[j]) {
+                i++;
+                j++;
+                if (j == m) { 
+                    ++cur_count;
+                    j = lps[j - 1];
+                }
+            } else {
+                if (j != 0) {
+                    j = lps[j - 1];
+                } else {
+                    i++;
+                }
+            }
+        }
+
+        if (cur_count != 0) {
+            std::lock_guard<std::mutex> ifm(parrent.information_found_mutex);
+            parrent.information_found[chunc[k].first] = std::make_pair(text, cur_count);
+        }
+    }
+    parrent.completed_chunks.fetch_add(1);
+    parrent.information_cv.notify_one();
+    return;
+}
 
 
-
-
-
-
-
-
-
-
+void SearchInAChunk::show_result() {
+    std::cout << "Auxiliary task for searching in a file is completed\n";
+    return;
+}
 

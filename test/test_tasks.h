@@ -12,7 +12,7 @@
 
 // Тип задачи
 enum class TaskType {
-	ComputePrimes, SortRandom, WaitEcho, SortBigVec
+	ComputePrimes, SortRandom, WaitEcho, SortBigVec, SearchInALargeFile
 };
 
 
@@ -54,7 +54,7 @@ struct WaitEcho : public MT::Task {
 
 
 
-struct SortingChunk;
+class SortingChunk;
 
 // Сотрировка элементов файла, при этом многопоточная
 class SortBigVec : public MT::Task {
@@ -98,3 +98,39 @@ class SortingChunk : public MT::Task {
 
 
 
+class SearchInAChunk;
+
+class SearchInALargeFile : public MT::Task {
+    std::map<size_t, std::pair<std::string, size_t>> information_found;
+    std::string path_to_file;
+    std::string word;
+
+    std::mutex information_found_mutex;
+    std::condition_variable information_cv;
+    std::atomic<size_t> completed_chunks{0};
+
+    size_t chunk_size = 100;
+
+    friend class SearchInAChunk;
+
+ public:
+
+    SearchInALargeFile(const std::string& path_to_file_, const std::string& phrase_);
+
+    void one_thread_method() override;
+    void show_result() override;
+
+};
+
+
+class SearchInAChunk : public MT::Task {
+    SearchInALargeFile& parrent;
+    std::vector<std::pair<size_t, std::string>> chunc;
+
+ public:
+
+    SearchInAChunk(SearchInALargeFile& parrent_, std::vector<std::pair<size_t, std::string>>&& chunc);
+
+    void one_thread_method() override;
+    void show_result() override;
+};

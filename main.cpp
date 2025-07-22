@@ -12,6 +12,7 @@ TaskType parseType(const std::string& cmd) {
     if (cmd == "sort_random") return TaskType::SortRandom;
     if (cmd == "wait_echo") return TaskType::WaitEcho;
     if (cmd == "sort_big_vec") return TaskType::SortBigVec;
+	if (cmd == "search_in_file") return TaskType::SearchInALargeFile;
     throw std::runtime_error("Unknown command");
 }
 
@@ -25,6 +26,7 @@ int main() {
           	     "wait_echo SECONDS MESSAGE\n"
                  "result ID\n"
 				 "sort_big_vec\n"
+				 "search_in_file\n"
 				 "pause - to pause working server\n"
 				 "start - to resume working server\n"
 				 "count working threads - press '?'\n"
@@ -69,6 +71,12 @@ int main() {
 					thread_pool.add_task(test);
 				} else if (type == TaskType::SortBigVec) {
 					std::shared_ptr test{std::make_shared<SortBigVec>()};
+					thread_pool.add_task(std::move(test));
+				} if (type == TaskType::SearchInALargeFile) {
+					std::string path_to_file, phrase;
+					std::cin >> path_to_file >> phrase;
+					std::cin.get();
+					std::shared_ptr test{std::make_shared<SearchInALargeFile>(path_to_file, phrase)};
 					thread_pool.add_task(std::move(test));
 				}
 		    } catch (std::exception& e) {
