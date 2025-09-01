@@ -66,7 +66,7 @@ class SortBigVec : public MT::Task {
     std::filesystem::path dir_name;
 
     std::vector<std::string> temp_files;
-    const size_t chunk_size = 100'000;
+    const size_t chunk_size = 1'000'000;
     size_t file_id;
     size_t n;
 
@@ -95,6 +95,9 @@ class SortingChunk : public MT::Task {
     void one_thread_method() override;
     void show_result() override;
 };
+
+
+
 
 
 

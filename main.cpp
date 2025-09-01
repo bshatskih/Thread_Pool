@@ -70,7 +70,7 @@ int main() {
 					std::shared_ptr test{std::make_shared<WaitEcho>(sec, message)};
 					thread_pool.add_task(test);
 				} else if (type == TaskType::SortBigVec) {
-					std::shared_ptr test{std::make_shared<SortBigVec>()};
+					std::shared_ptr test{std::make_shared<SortBigVec>(std::stoi(data))};
 					thread_pool.add_task(std::move(test));
 				} if (type == TaskType::SearchInALargeFile) {
 					std::string path_to_file, phrase;

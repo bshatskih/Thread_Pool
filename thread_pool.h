@@ -58,7 +58,7 @@ namespace MT {
     struct Thread {
         std::thread _thread;
         std::atomic<bool> is_working;
-
+        
         Thread() : _thread(), is_working(false) {}
 
         Thread(const std::thread& other) = delete;
@@ -89,11 +89,13 @@ namespace MT {
 			task_queue.push(std::move(task));
 			// задаём уникальный идентификатор новой задаче, минимальный id равен 1
 			task_queue.back()->task_id = ++last_task_id;
-			// связываем задачу с текущим пулом
+
+            // Логируем добавление задачи в очередь
             {
                 std::lock_guard<std::mutex> cl(cout_mutex);
 			    std::cout << "Task submitted with ID: " << last_task_id << '\n';
             }
+			// связываем задачу с текущим пулом
 			task_queue.back()->thread_pool = this;
 			tasks_access.notify_one();
 			return last_task_id;
@@ -135,15 +137,14 @@ namespace MT {
 
         ~ThreadPool();
 
-        // мьютекс для вывода в консоль
-        std::mutex cout_mutex;
-
-
      private:
         // мьютексы, блокирующие очереди для потокобезопасного обращения
         std::mutex task_queue_mutex;
         std::mutex completed_tasks_mutex;
         std::mutex incomplete_tasks_with_an_error_mutex;
+
+        // мьютекс для вывода в консоль
+        std::mutex cout_mutex;
 
         // мьютекс, блокирующий функции ожидающие результатов (методы wait*)
         std::mutex wait_mutex;
