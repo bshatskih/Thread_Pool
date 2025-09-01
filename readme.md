@@ -93,65 +93,67 @@ struct Thread {
 
 ```c++
 class ThreadPool {
- public:
-
+    public:
     ThreadPool(size_t NUM_THREADS);
 
     // шаблонная функция добавления задачи в очередь
     template <typename TaskChild>
     size_t add_task(std::shared_ptr<TaskChild> task);
 
-    // ожидание полной обработки текущей очереди задач, игнорируя любые
-    // сигналы о приостановке
-    void wait();
+
+    // получение результата по id (необходимо заранее знать тип возвращаемого объекта)
+    template <typename TaskChild>
+    std::shared_ptr<TaskChild> get_result(size_t task_id);
+
+    // Для получения результата не зная типа объекта, который лежит под этим id
+    void get_result(size_t task_id);
+
+    // Возвращает число работающий потоков
+    size_t count_working_threads();
 
     // приостановка обработки
-    void stop();
+    void pause();
 
     // возобновление обработки
     void start();
 
-    // получение результата по id
-    template <typename TaskChild>
-    std::shared_ptr<TaskChild> get_result(size_t id);
+    void wait();
 
-    // очистка завершенных задач
+    // очистить выполненные задач
     void clear_completed();
 
-    // установка флага логирования
     void set_logger_flag(bool flag);
+
+    size_t count_of_threads();
 
     ~ThreadPool();
 
-
- protected:
+    private:
     // мьютексы, блокирующие очереди для потокобезопасного обращения
     std::mutex task_queue_mutex;
     std::mutex completed_tasks_mutex;
-    
+    std::mutex incomplete_tasks_with_an_error_mutex;
+
+
+    // мьютекс для вывода в консоль
+    std::mutex cout_mutex;
+
+    // мьютекс, блокирующий функции ожидающие результатов (методы wait*)
+    std::mutex wait_mutex;
+
     // мьютекс, блокирующий логер для последовательного вывода
     std::mutex logger_mutex;
 
-    // мьютекс, блокирующий функции ожидающие результаты (метод wait())
-    std::mutex wait_mutex;
+    std::condition_variable tasks_access; 
+    std::condition_variable wait_access;   
 
-
-    std::condition_variable tasks_access;
-    std::condition_variable wait_access;
-
-    // флаг остановки работы пула
-    std::atomic<bool> stopped;
-    // флаг приостановки работы
-    std::atomic<bool> paused;
-    // флаг, разрешающий логирования
-    std::atomic<bool> logger_flag;
-
-    // набор доступных потоков
+    // Набор доступных потоков
     std::vector<MT::Thread> threads;
 
-    Logger logger;
+    // Хранит число созданных потоков для их корректного завершения
+    size_t actual_threads_count;
 
-    // очередь задач
+    // Очередь задач
     std::queue<std::shared_ptr<Task>> task_queue;
     size_t last_task_id;
 
@@ -159,15 +161,28 @@ class ThreadPool {
     std::unordered_map<size_t, std::shared_ptr<Task>> completed_tasks;
     size_t completed_task_count;
 
+    // id задач, в которых возникла ошибка при выполнении
+    std::unordered_set<size_t> incomplete_tasks_with_an_error;
+
+    // флаг остановки работы пула
+    std::atomic<bool> stopped;
+    // флаг логирования - способ отключить логирование
+    std::atomic<bool> logger_flag;
+    // флаг приостановки работы
+    std::atomic<bool> paused;
+
+    Logger logger;
+
     // основная функция, инициализирующая каждый поток
     void run(MT::Thread& thread);
 
     // разрешение запуска очередного потока
     bool run_allowed() const;
 
-    // Проверка решения всех задач, переданных пулу
+    // Проверка того, выполнены ли все задачи
     bool is_comleted() const;
-}
+
+};
 ```
 
 Для хранения задач в очереди я использовал "умные" указатели `std::shared_ptr`. Это, в основном, необходимо для преобразования из дочернего класса задачи в базовый класс Task (*upcasting*) при добавлении в очередь и обратно (*downcasting*) при выгрузке результата ("игра на понижение").
@@ -205,13 +220,31 @@ MT::ThreadPool::ThreadPool(size_t NUM_THREADS) : logger(logger_mutex) {
 	completed_task_count = 0;
     last_task_id = 0;
 	threads.reserve(NUM_THREADS);
+
 	for (size_t i : std::ranges::iota_view(static_cast<size_t>(0), NUM_THREADS)) {
-		threads.emplace_back();
+		try {
+			threads.emplace_back();
+		} catch (const std::system_error& e) {
+			std::string error_code_str = std::to_string(e.code().value()); 
+			std::string error = std::string("When creating thread caught system_error with code ") + "[" + error_code_str + "] meaning " + "[" + e.what() + "]";
+			std::time_t error_time = std::time(nullptr);
+			
+			{
+				std::lock_guard<std::mutex> cm(cout_mutex);
+				std::cerr << error << '\n';
+			}
+			std::lock_guard<std::mutex> lm(logger_mutex);
+			logger.log_error(error_time, error);
+			actual_threads_count = i;
+			throw;
+		}
 	}
+	
 	for (size_t i : std::ranges::iota_view(static_cast<size_t>(0), NUM_THREADS)) {
 		threads[i]._thread = std::move(std::thread(&ThreadPool::run, this, std::ref(threads[i])));
 		threads[i].is_working.store(false);
 	}
+	actual_threads_count = NUM_THREADS;
 }
 ```
 
@@ -219,48 +252,84 @@ MT::ThreadPool::ThreadPool(size_t NUM_THREADS) : logger(logger_mutex) {
 
 Флаг `ThreadPool::stopped` должен быть неизменно в состоянии `false` вплоть до вызова деструктора. Он указывает на то, что пул потоков все еще "жив" и способен выполнять поступающие задачи.
 
+Стыдно признаться, но при реализации конструктора я наступил на грабли под названием инвалидация указателей в векторе, поскольку изначатьно просто написал `threads.emplace_back();`, а потом долго и упорно искал ошибку, однако это привнесло и некоторые положительные моменты - я обложил код защитой от исключений во всех местах, где они потенциально могут возникнуть. Поэтому если при попытке открыть очередной поток произойдёт ошибка и будет брошено исклющение, то оно будет успешно обработано, в консоль будет выведено сообщение об ошибке, а также оно будет добавлено в логирующий файл. Также мы запоминаем число реально существующий потоков в переменной `actual_threads_count` - в случае корректной работы оно будет совпадать с `NUM_THREADS`.
+
+Также считаю необходимым отдельно разобрать следующую строчку:
+`threads[i]._thread = std::move(std::thread(&ThreadPool::run, this, std::ref(threads[i])));`,
+
+
 Каждый поток запускается с вызовом закрытого метода `ThreadPool::run`, передавая указатель на самого себя для контроля состояния (управление флагом `Thread::is_working`):
+1) Создаём новый поток `std::thread(&ThreadPool::run, this, std::ref(threads[i]))`, насчёт `&ThreadPool::run` всё и так понятно, `this` необходим для вызова этого метода, а `std::ref(threads[i])` - является параметром метода, необходимым для доступа к данным потока (в моём случае это необходимо для получения доступа к флагу `is_working `)
+2) Перемещаем вновь созданный поток в член `_thread` структуры `Thread`
+
+Перейдём к реализации метода `run`:
 
 ```c++
 void MT::ThreadPool::run(MT::Thread& _thread) {
-    while (!stopped.load()) {
+   while (!stopped.load()) {
         std::unique_lock<std::mutex> lock(task_queue_mutex);
 
-        // текущий поток находится в режиме ожидания в случае,
-        // если нет заданий либо работа всего пула приостановлена
-        tasks_access.wait(lock, [this]() -> bool { return run_allowed() || stopped.load()});
+        tasks_access.wait(lock, [this]() -> bool { return run_allowed() || stopped.load(); });
+
 
         if (run_allowed()) {
-            _thread.is_working.store(true);
-
-            //достаём задачу из очереди
             std::shared_ptr<Task> task = std::move(task_queue.front());
+            _thread.is_working.store(true);
             task_queue.pop();
-            lock.unlock();
+			lock.unlock();
 
+			std::time_t start_time = std::time(nullptr);
+
+			try {
+            	task->one_thread_pre_method();
+			} catch (const std::exception& e) {
+				std::time_t error_time = std::time(nullptr);
+				std::string error = std::string("Error when solving a problem with an id: ") + std::to_string(task->task_id) + ".\nException: " + e.what();
+				std::lock_guard<std::mutex> cm(cout_mutex);
+				std::cerr << error << '\n';
+
+				if (logger_flag.load()) {
+					std::lock_guard<std::mutex> lm(logger_mutex);
+					logger.log_error(error_time, error);
+				}
+				std::lock_guard<std::mutex> itm(incomplete_tasks_with_an_error_mutex);
+				incomplete_tasks_with_an_error.insert(task->task_id);
+				continue;
+			} catch (...) {
+				std::time_t error_time = std::time(nullptr);
+				std::lock_guard<std::mutex> cm(cout_mutex);
+				std::string error = std::string("Unknown error in task id: ") + std::to_string(task->task_id);
+				std::cerr << error << '\n';
+
+				if (logger_flag.load()) {
+					std::lock_guard<std::mutex> lm(logger_mutex);
+					logger.log_error(error_time, error);
+				}
+				std::lock_guard<std::mutex> itm(incomplete_tasks_with_an_error_mutex);
+				incomplete_tasks_with_an_error.insert(task->task_id);
+				continue;
+			}
+
+			std::time_t end_time = std::time(nullptr);
+
+            // Логируем выполение задачи
             if (logger_flag.load()) {
-                std::lock_guard<std::mutex> lg(logger_mutex);
-                std::cout << timer.make_checkpoint("Run task " + elem->description) << std::endl;
-            }
-
-            // решение задачи
-            task->one_thread_pre_method();
-
-            if (logger_flag) {
-                std::lock_guard<std::mutex> lg(logger_mutex);
-                std::cout << timer.make_checkpoint("End task " + elem->description) << std::endl;
-            }
+				std::lock_guard<std::mutex> lg(logger_mutex);
+				logger.add_record_about_task(start_time, end_time, task->description);
+			}
 
             std::lock_guard<std::mutex> lg(completed_tasks_mutex);
-            completed_tasks[task->task_id] = task;
-            ++completed_task_count;
-            _thread.is_working.store(false);
+			completed_tasks[task->task_id] = std::move(task);
+			++completed_task_count;
+			_thread.is_working.store(false);
         }
-        // пробуждение потока, который находятся в ожидании пула (метод wait*)
-        wait_access.notify_one()
+		wait_access.notify_one();
     }
 }
 ```
+
+Пока флаг `stopped == false`, мы пытаемся захватить `task_queue_mutex`, для того, чтобы взять задачу из очереди для последующего выполения, условная переменная `tasks_access`, проверяет, есть ли задачи в очереди, не постален ли он на паузу или же не завешшает ли сервер свою работу, если одно из условий выполено, то мы захватываем `task_queue_mutex` и получаем доступ к очреди задач. Далее мы достаём очередную задачу из очереди и отпускаем мьютекс, затем - исполнение задачи. 
+Поскольку `one_thread_pre_method()` потенциально может завершиться неудачно, то необходимо аккуратно обработать такую ситуацию, поскольку мы точно не хотим, чтобы наш пул падал из-за того, что одна из задач завершиласть неудачно. Точно также, как и с ошибками при открытии потоков в контрукторе, мы логируем соощение о неудачном завершении задачи, а также дабавляем её индекс в `incomplete_tasks_with_an_error`, чтобы при попытке получить результат пользователь мог узнать, что была совершена попытка выполнить задачу, но она закончилась неудачно.
 
 Как видно в реализации, решенная задача кладется в `ThreadPool::completed_tasks` в неизменном виде по ключу `Task::task_id`. Мною было решено не вводить излишних усложнений в виде дополнительных классов для сохранения результатов, к тому же совершенно неясно, что будет являться результатом, потому пришлось бы использовать `std::any`. Пользователь самостоятельно определит нужные ему ресурсы в дочернем классе задачи, которые будут изменены или заполнены при помощи переопределенного метода `Task::one_thread_method()`.
 
@@ -270,13 +339,25 @@ void MT::ThreadPool::start() {
         paused.store(false);
         // даем всем потокам разрешающий сигнал для доступа к очереди невыполненных задач
         tasks_access.notify_all();
+		// логируем
+		if (logger_flag) {
+			logger.log_start(std::time(nullptr));
+		}
     }
     return;
 }
 
 
+
 void MT::ThreadPool::pause() {
-    paused.store(true);
+	if (paused.load() == false) {
+    	paused.store(true);
+
+		// логируем 
+		if (logger_flag) {
+			logger.log_paused(std::time(nullptr));
+		}
+	}
     return;
 }
 ```
@@ -289,11 +370,15 @@ void MT::ThreadPool::pause() {
 template <typename TaskChild>
 size_t add_task(std::shared_ptr<TaskChild> task) {
     std::lock_guard<std::mutex> lock(task_queue_mutex);
-    task_queue.push(task)
+    task_queue.push(std::move(task));
+    // задаём уникальный идентификатор новой задаче, минимальный id равен 1
+    task_queue.back()->task_id = ++last_task_id;
 
-    // присваиваем уникальный id новой задаче
-    // минимальное значение id равно 1
-    task_queue.back()->id = ++last_task_id;
+    // Логируем добавление задачи в очередь
+    {
+        std::lock_guard<std::mutex> cl(cout_mutex);
+        std::cout << "Task submitted with ID: " << last_task_id << '\n';
+    }
     // связываем задачу с текущим пулом
     task_queue.back()->thread_pool = this;
     tasks_access.notify_one();
@@ -319,11 +404,36 @@ size_t add_task(std::shared_ptr<TaskChild> task) {
 
 Для корректного преобразования типов внутри `ThreadPool::get_result`, необходимо заранее знать тип задачи.
 
+Также можно воспользоваться нешаблонной перегрузной `ThreadPool::get_result` для вывода результата заачи в консоль:
 ```c++
-bool MT::ThreadPool::is_comleted() const {
-	return completed_task_count == last_task_id;
+void MT::ThreadPool::get_result(size_t task_id) {
+	std::lock_guard<std::mutex> lock(completed_tasks_mutex);
+	std::lock_guard<std::mutex> cl(cout_mutex);
+	auto it = completed_tasks.find(task_id);
+	if (it != completed_tasks.end()) {
+		std::cout << "Result [" << task_id << "]:\n";
+		it->second->show_result();
+	} else if (task_id > last_task_id || task_id <= 0) {
+		std::cout << "Unknown task ID\n";
+	} else {
+		std::lock_guard<std::mutex> itm(incomplete_tasks_with_an_error_mutex);
+		if (incomplete_tasks_with_an_error.contains(task_id)) {
+			std::cout << "An error occurred while completing the task\n";
+		} else {
+			std::cout << "Result [" << task_id << "]: still processing...\n";
+		}
+	}
+	return;
 }
+```
 
+Возможны четыре варианта:
+- id задачи содержится в `completed_tasks`, тогда будет вызвана виртуальная функция `show_result()`, отображающая результат выполнения задачи
+- id меньше нуля или больше общего числа задач, тогда будет выведено сообщение, что такой задачи нет
+- id задачи содержится в `incomplete_tasks_with_an_error`, тогда будет выведено сообщение, что при попытке выполнить задачу произошла ошибка
+- в противном случае задача выполняется или ждёт своей очереди
+
+```c++
 void MT::ThreadPool::wait() {
 	std::lock_guard<std::mutex> lock_wait(wait_mutex);
 
@@ -338,7 +448,7 @@ void MT::ThreadPool::wait() {
 
 Метод `ThreadPool::wait()` позволяет дождаться выполнения всех текущих задач из очереди ThreadPool::task_queue, игнорируя сигналы об остановке.
 
-Остались еще пару вспомогательных методов и деструктор:
+Остались еще пару вспомогательных методов:
 
 ```c++
 void MT::ThreadPool::clear_completed() {
@@ -346,26 +456,17 @@ void MT::ThreadPool::clear_completed() {
 	completed_tasks.clear();
 }
 
+// Позволяет включать и отключать логирование
 void MT::ThreadPool::set_logger_flag(bool flag) {
 	logger_flag = flag;
 }
 
-MT::ThreadPool::~ThreadPool() {
-	stopped.store(true);
-	tasks_access.notify_all();
-	for (size_t i : std::ranges::iota_view(static_cast<size_t>(0), threads.size())) {
-        if (threads[i]._thread.joinable()) {
-		    threads[i]._thread.join();
-        }
-	}
+// Проверяет, все ли задачи выполнены
+bool MT::ThreadPool::is_comleted() const {
+	return completed_task_count + incomplete_tasks_with_an_error.size() == last_task_id;
 }
-```
 
-Метод `ThreadPool::clear_completed()` может пригодиться для того, чтобы не хранить ненужные результаты на протяжении всего времени жизни пула. Как я и обещал ранее, флаг `ThreadPool::stopped` становится `true` только в момент уничтожения пула. Собственно говоря, тут и происходит `std::thread::join()` каждого из потоков.
-
-Позднее мной был реализован метод, который должен был считать количество загруженных потоков:
-
-```c++
+// возвращает количество загруженных потоков
 size_t MT::ThreadPool::count_working_threads() {
 	size_t result = 0;
 	for (uint16_t i : std::ranges::iota_view(0u, threads.size())) {
@@ -373,15 +474,62 @@ size_t MT::ThreadPool::count_working_threads() {
 	}
 	return result;
 }
+
+// возвращает число потоков
+size_t MT::ThreadPool::count_of_threads() {
+	return threads.size();
+}
 ```
+
+Метод `ThreadPool::clear_completed()` может пригодиться для того, чтобы не хранить ненужные результаты на протяжении всего времени жизни пула. Как я и обещал ранее, флаг `ThreadPool::stopped` становится `true` только в момент уничтожения пула. Собственно говоря, тут и происходит `std::thread::join()` каждого из потоков.
+
+Деструктор:
+```c++
+MT::ThreadPool::~ThreadPool() {
+	wait();
+	stopped.store(true);
+	tasks_access.notify_all();
+	for (size_t i : std::ranges::iota_view(static_cast<size_t>(0), actual_threads_count)) {
+        if (threads[i]._thread.joinable()) {
+		    try {
+                threads[i]._thread.join();
+            } catch (const std::system_error& e) {
+				std::string error_code_str = std::to_string(e.code().value()); 
+				std::string error = std::string("When joining thread caught system_error with code ") + "[" + error_code_str + "] meaning " + "[" + e.what() + "]";
+				std::time_t error_time = std::time(nullptr);
+				{
+					std::lock_guard<std::mutex> cm(cout_mutex);
+					std::cerr << error << '\n';
+				}
+				if (logger_flag.load()) {
+					std::lock_guard<std::mutex> lm(logger_mutex);
+					logger.log_error(error_time, error);
+				}
+            }
+        }
+	}
+}
+```
+
+Поскольку, как было сказано ранее я старался аккуратно обрабатывать исключения, то и здесь мы сначала проверяем, можно ли присоединить поток, и если да, то присоединяем, если при этом возникают ошибки - корректно их обрабатываем. Ещё стоит сказать, что посколько при открытии потоков могла произойти ошибка, то закрывать мы будем не `NUM_THREADS` потоков, а `actual_threads_count`.
 
 ### Пример использования ThreadPool
 
 Я написал небольшую эмуляцию сервера, для демонстрации работы `ThreadPool`:
 
 ```c++
+TaskType parseType(const std::string& cmd) {
+    if (cmd == "compute_primes") return TaskType::ComputePrimes;
+    if (cmd == "sort_random") return TaskType::SortRandom;
+    if (cmd == "wait_echo") return TaskType::WaitEcho;
+    if (cmd == "sort_big_vec") return TaskType::SortBigVec;
+	if (cmd == "search_in_file") return TaskType::SearchInALargeFile;
+    throw std::runtime_error("Unknown command");
+}
+
+
 int main() {
-    MT::ThreadPool thread_pool(4);
+    MT::ThreadPool thread_pool(5);
 
     std::cout << "Server started. Enter commands:\n";
   	std::cout << "compute_primes N\n"
@@ -389,6 +537,7 @@ int main() {
           	     "wait_echo SECONDS MESSAGE\n"
                  "result ID\n"
 				 "sort_big_vec\n"
+				 "search_in_file\n"
 				 "pause - to pause working server\n"
 				 "start - to resume working server\n"
 				 "count working threads - press '?'\n"
@@ -428,11 +577,18 @@ int main() {
 					std::string message;
 					iss >> sec;
 					std::getline(iss, message);
+					message.erase(message.begin());
 					std::shared_ptr test{std::make_shared<WaitEcho>(sec, message)};
 					thread_pool.add_task(test);
 				} else if (type == TaskType::SortBigVec) {
-					std::shared_ptr test{std::make_shared<SortBigVec>()};
-					thread_pool.add_task(test);
+					std::shared_ptr test{std::make_shared<SortBigVec>(std::stoi(data))};
+					thread_pool.add_task(std::move(test));
+				} if (type == TaskType::SearchInALargeFile) {
+					std::string path_to_file, phrase;
+					std::cin >> path_to_file >> phrase;
+					std::cin.get();
+					std::shared_ptr test{std::make_shared<SearchInALargeFile>(path_to_file, phrase)};
+					thread_pool.add_task(std::move(test));
 				}
 		    } catch (std::exception& e) {
 				std::cout << "Error: " << e.what() << '\n';
@@ -448,7 +604,7 @@ int main() {
 
 #### SortBigVec
 
-Многопоточная задача для сортировки большого числа `int16_t` значений, записанных в файл.
+Многопоточная задача для сортировки большого числа `int32_t` значений, записанных в файл.
 
 - Создаёт файл с `n` случайными числами.
 - Разбивает на чанки (`chunk_size`), каждый сортируется в отдельном потоке.
@@ -490,3 +646,7 @@ int main() {
 #### WaitEcho
 
 Задача, имитирующая задержку и вывод сообщения.
+
+#### SearchInALargeFile
+
+Задача, по реализации аналогичная `SortBigVec`, ищет фразу в тексте, используя алгоритм Кнута-Морриса-Пратта (КМП)
