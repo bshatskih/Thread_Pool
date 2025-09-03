@@ -64,6 +64,17 @@ struct Logger {
     }
 
 
+    void log_deadlock(const std::time_t& time, size_t count_of_threads) {
+        std::ofstream file("../log_file.txt", std::ios::app);
+        file << "Deadlock has occurred, a new thread has been created\n" 
+             << "Current number of threads - " 
+             << count_of_threads << ", new number of threads - " 
+             << count_of_threads + 1 << '\n';
+        file << "Time: " << getCurrentTimeFormatted(time) << "\n\n";
+        file.close();
+    }
+
+
     ~Logger() {
         std::ofstream file("../log_file.txt", std::ios::app);
         file << "Server end working; time: ";
