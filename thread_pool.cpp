@@ -15,13 +15,13 @@ void MT::Task::one_thread_pre_method() {
 }
 
 
-MT::ThreadPool::ThreadPool(size_t NUM_THREADS) : logger(logger_mutex) {
+MT::ThreadPool::ThreadPool(size_t NUM_THREADS) : logger(logger_mutex), controller(*this) {
 	paused.store(true);
     stopped.store(false);
     logger_flag.store(true);
 	completed_task_count = 0;
     last_task_id = 0;
-	threads.reserve(NUM_THREADS);
+	threads.reserve(max_threads);
 
 	for (size_t i : std::ranges::iota_view(static_cast<size_t>(0), NUM_THREADS)) {
 		try {
@@ -45,6 +45,7 @@ MT::ThreadPool::ThreadPool(size_t NUM_THREADS) : logger(logger_mutex) {
 	for (size_t i : std::ranges::iota_view(static_cast<size_t>(0), NUM_THREADS)) {
 		threads[i]._thread = std::move(std::thread(&ThreadPool::run, this, std::ref(threads[i])));
 		threads[i].is_working.store(false);
+		threads[i].is_waiting.store(false);
 	}
 	actual_threads_count = NUM_THREADS;
 }
@@ -233,3 +234,107 @@ size_t MT::ThreadPool::count_working_threads() {
 size_t MT::ThreadPool::count_of_threads() {
 	return threads.size();
 }
+
+
+size_t MT::ThreadPool::count_waiting_threads() {
+	size_t result = 0;
+	for (uint16_t i : std::ranges::iota_view(0u, threads.size())) {
+		result += threads[i].is_waiting.load();
+	}
+	return result;
+}
+
+
+MT::ThreadPoolController::ThreadPoolController(MT::ThreadPool& pool_ref) : pool(pool_ref) {
+	controller_thread = std::move(std::thread(&ThreadPoolController::monitor, this));
+	
+}
+
+
+MT::ThreadPoolController::~ThreadPoolController() {
+	stopped.store(true);
+	if (controller_thread.joinable()) {
+		controller_thread.join();
+	}
+}
+
+
+void MT::ThreadPoolController::monitor() {
+	while(!stopped.load()) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        check_for_deadlock();
+	}
+}
+
+
+void MT::ThreadPoolController::check_for_deadlock() {
+	size_t count_of_threads = pool.count_of_threads();
+	size_t count_of_waiting_threads = pool.count_waiting_threads();
+
+	if (count_of_threads == count_of_waiting_threads) {
+		std::time_t deadlock_time = std::time(nullptr);
+		{
+			std::lock_guard<std::mutex> cm(pool.cout_mutex);
+			std::cerr << "Deadlock detected! Expanding pool...\n";
+		}
+
+		if (pool.logger_flag.load()) {
+			std::lock_guard<std::mutex> lm(pool.logger_mutex);
+			pool.logger.log_deadlock(deadlock_time, pool.count_of_threads());
+		}
+		pool.expand();
+	}
+}
+
+
+void MT::ThreadPool::expand() {
+	if (count_of_threads() == max_threads) {
+		std::string error_str = "The number of open threads has exceeded the maximum allowed limit.";
+		std::time_t error_time = std::time(nullptr);
+
+		{
+			std::lock_guard<std::mutex> cm(cout_mutex);
+			std::cerr << error_str << "\nFurther pool operation is not possible\n";
+		}
+
+		if (logger_flag.load()) {
+			std::lock_guard<std::mutex> lm(logger_mutex);
+			logger.log_error(error_time, error_str);
+		}
+		throw;
+	}
+    std::lock_guard<std::mutex> lock(task_queue_mutex);
+    try {
+		threads.emplace_back();
+		threads.back()._thread = std::move(std::thread(&ThreadPool::run, this, std::ref(threads.back())));
+		threads.back().is_working.store(false);
+		threads.back().is_waiting.store(false);
+		actual_threads_count++;
+	} catch (const std::system_error& e) {
+		std::string error_code_str = std::to_string(e.code().value()); 
+		std::string error = std::string("When creating thread caught system_error with code ") + "[" + error_code_str + "] meaning " + "[" + e.what() + "]";
+		std::time_t error_time = std::time(nullptr);
+		
+		{
+			std::lock_guard<std::mutex> cm(cout_mutex);
+			std::cerr << error << '\n';
+		}
+		std::lock_guard<std::mutex> lm(logger_mutex);
+		logger.log_error(error_time, error);
+		--actual_threads_count;
+		throw;
+	}
+}
+
+
+void MT::ThreadPool::set_current_thread_waiting(bool waiting_status) {
+	std::thread::id current_id = std::this_thread::get_id();
+	for (auto& thread : threads) {
+		if (thread._thread.get_id() == current_id) {
+			thread.is_waiting.store(waiting_status);
+			return;
+		}
+	}
+}
+
+

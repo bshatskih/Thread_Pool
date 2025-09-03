@@ -57,6 +57,7 @@ namespace MT {
     // Обёртка для потока
     struct Thread {
         std::thread _thread;
+        std::atomic<bool> is_waiting;
         std::atomic<bool> is_working;
         
         Thread() : _thread(), is_working(false) {}
@@ -76,9 +77,24 @@ namespace MT {
     };
 
 
+    class ThreadPoolController {
+        ThreadPool& pool;
+        std::thread controller_thread;
+        std::atomic<bool> stopped{false};
 
+    public:
+
+        ThreadPoolController(MT::ThreadPool& pool_ref);
+
+        ~ThreadPoolController();
+
+        void monitor();
+
+        void check_for_deadlock();
+    };
 
     class ThreadPool {
+        friend class ThreadPoolController;
      public:
         ThreadPool(size_t NUM_THREADS);
 
@@ -135,6 +151,10 @@ namespace MT {
 
         size_t count_of_threads();
 
+        size_t count_waiting_threads();
+
+        void set_current_thread_waiting(bool waiting_status);
+
         ~ThreadPool();
 
      private:
@@ -157,6 +177,8 @@ namespace MT {
 
         // Набор доступных потоков
         std::vector<MT::Thread> threads;
+
+        const size_t max_threads = 100;
 
         // Хранит число созданных потоков для их корректного завершения
         size_t actual_threads_count;
@@ -181,6 +203,8 @@ namespace MT {
 
         Logger logger;
 
+        MT::ThreadPoolController controller;
+
         // основная функция, инициализирующая каждый поток
 		void run(MT::Thread& thread);
 
@@ -189,5 +213,6 @@ namespace MT {
 
         bool is_comleted() const;
 
+        void expand();
     };
 }
