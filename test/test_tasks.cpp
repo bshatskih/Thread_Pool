@@ -161,8 +161,12 @@ void SortBigVec::one_thread_method() {
         thread_pool->add_task(std::move(test));
     }
 
+    thread_pool->set_current_thread_waiting(true);
+
     std::unique_lock<std::mutex> lock(temp_files_mutex);
     chunks_cv.wait(lock, [&]() { return completed_chunks.load() == expected_chunks; });
+
+    thread_pool->set_current_thread_waiting(false);
 
     merge_sorted_chunks();
     file.close();
@@ -268,8 +272,12 @@ void SearchInALargeFile::one_thread_method() {
         ++cur_str_number;
     }
 
+    thread_pool->set_current_thread_waiting(true);
+
     std::unique_lock<std::mutex> ifm(information_found_mutex);
     information_cv.wait(ifm, [&]() { return completed_chunks.load() == expected_chunks; });
+
+    thread_pool->set_current_thread_waiting(false);
 
     file.close();
 

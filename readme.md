@@ -650,3 +650,133 @@ int main() {
 #### SearchInALargeFile
 
 Задача, по реализации аналогичная `SortBigVec`, ищет фразу в тексте, используя алгоритм Кнута-Морриса-Пратта (КМП)
+
+### Проблема deadlock-ов
+
+Во время ручного тестирования проекта я столкнулся с неожиданной проблемой - добавление возможности для класса Task самостоятельно добавлять задачи в пул даёт возможность для паспараллеливания вычислений в рамках одной задачи, но в то же время создаёт неиллюхорную опасность возникновения deadlock-а.
+Рассмотрим следующий пример: пусть у нас есть пул, в котором открыты 4 потока, и мы отдадим ему 4 задачи на сортировку вектора, возникает опасность того, что в какой-то момент времени все потоки будут заняты именно этими задачами, которые, в свою очередь, отдадут в пул задачи на сортировку чанков, которые уже некому будет выолнять. 
+Возникает ни что иное как deadlock, немного почитав, я понял, что далеко не первый человек, который столкнулся с такой проблемой, и её решение уже давно существует - реализация механизма "воркер-воркер" (worker-worker) или использование отдельной очереди для вложенных задач. Эти решения наиболее эффективно решают возникшую проблему, но мне в голову пришла другая идея, сразу оговорюсь, что она менее эффективная, но я не хочу вносить значимые изменения в архитектуру пула, поэтому остановлюсь именно на ней - реализация вспомогательного класса `ThreadPoolController`. Задачей этого класса будет мониторить ситуацию с пулом и регулярно проверять, не возник ли deadlock, и если он возник - открывать новые потоки в существующем пуле.
+
+Приступим к реализации:
+
+```c++
+class ThreadPoolController {
+	// Cсылка на пул, за которым мы наблюдаем
+	ThreadPool& pool;
+	// Поток, в котором будет работать функция, производящая наблюдение за пулом
+	std::thread controller_thread;
+	std::atomic<bool> stopped{false};
+
+public:
+
+	ThreadPoolController(MT::ThreadPool& pool_ref);
+
+	~ThreadPoolController();
+
+	void monitor();
+
+	void check_for_deadlock();
+};
+```
+
+Реализация конструктора и деструктора довольна тривиальная, поговорим сразу про функции наблюдения:
+```c++
+void MT::ThreadPoolController::monitor() {
+	while(!stopped.load()) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        check_for_deadlock();
+	}
+}
+
+
+void MT::ThreadPoolController::check_for_deadlock() {
+	size_t count_of_threads = pool.count_of_threads();
+	size_t count_of_waiting_threads = pool.count_waiting_threads();
+
+	if (count_of_threads == count_of_waiting_threads) {
+		std::time_t deadlock_time = std::time(nullptr);
+		{
+			std::lock_guard<std::mutex> cm(pool.cout_mutex);
+			std::cerr << "Deadlock detected! Expanding pool...\n";
+		}
+
+		if (pool.logger_flag.load()) {
+			std::lock_guard<std::mutex> lm(pool.logger_mutex);
+			pool.logger.log_deadlock(deadlock_time, pool.count_of_threads());
+		}
+		pool.expand();
+	}
+}
+```
+
+- `monitor()` - функция, которая раз в 100ms совершает проверку, на возможный deadlock в пуле
+- `check_for_deadlock()` - функция проверки наличия dedlock-а, в случае выявлении такового выводит сообщение об этом в консоль, логирует, а также вызывает функция `expand()`, которая увеличивает число потоков
+
+Новые функции в классе `ThreadPool`:
+```c++
+
+void MT::ThreadPool::expand() {
+	if (count_of_threads() == max_threads) {
+		std::string error_str = "The number of open threads has exceeded the maximum allowed limit.";
+		std::time_t error_time = std::time(nullptr);
+
+		{
+			std::lock_guard<std::mutex> cm(cout_mutex);
+			std::cerr << error_str << "\nFurther pool operation is not possible\n";
+		}
+
+		if (logger_flag.load()) {
+			std::lock_guard<std::mutex> lm(logger_mutex);
+			logger.log_error(error_time, error_str);
+		}
+		throw;
+	}
+    std::lock_guard<std::mutex> lock(task_queue_mutex);
+    try {
+		threads.emplace_back();
+		threads.back()._thread = std::move(std::thread(&ThreadPool::run, this, std::ref(threads.back())));
+		threads.back().is_working.store(false);
+		threads.back().is_waiting.store(false);
+		actual_threads_count++;
+	} catch (const std::system_error& e) {
+		std::string error_code_str = std::to_string(e.code().value()); 
+		std::string error = std::string("When creating thread caught system_error with code ") + "[" + error_code_str + "] meaning " + "[" + e.what() + "]";
+		std::time_t error_time = std::time(nullptr);
+		
+		{
+			std::lock_guard<std::mutex> cm(cout_mutex);
+			std::cerr << error << '\n';
+		}
+		std::lock_guard<std::mutex> lm(logger_mutex);
+		logger.log_error(error_time, error);
+		--actual_threads_count;
+		throw;
+	}
+}
+
+// устанавливает флаг is_waiting для вызывающего потока
+void MT::ThreadPool::set_current_thread_waiting(bool waiting_status) {
+	std::thread::id current_id = std::this_thread::get_id();
+	for (auto& thread : threads) {
+		if (thread._thread.get_id() == current_id) {
+			thread.is_waiting.store(waiting_status);
+			return;
+		}
+	}
+}
+
+// возврвщает число ожидающих потоков
+size_t MT::ThreadPool::count_waiting_threads() {
+	size_t result = 0;
+	for (uint16_t i : std::ranges::iota_view(0u, threads.size())) {
+		result += threads[i].is_waiting.load();
+	}
+	return result;
+}
+```
+
+`expand()` - увеличивает число потоков на один, в случаевозникновении ошибок при создании нового потока - логирует и вывыводит в консоль сообщение об ошибке. Также я заложил максимально допустимое число потоков - max_threads, оно необходимо как чисто с архитектурной точки зрения - я не могу делать `emplase()` в `threads` предварительно не выделив память под все потоки, в противном случае ссылки, которые мы отдали в `ThreadPool::run()` инвалидируются, так и число с логической, навряд ли мы хотим открытия 10000 потоков...
+
+Также небольшим изменениям подверглись поля классов `ThreadPool` и `Thread`. В первый мы добавили поля `const size_t max_threads = 100`, а также `MT::ThreadPoolController controller;` - объект контроллера. Во второй - поле `std::atomic<bool> is_waiting;`
+
+Наконец немного изменился конструктор класса `ThreadPool` - добавлена инициализация `controller`, а также инициализацию флага `is_waiting` класса `Thread`.
